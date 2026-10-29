@@ -168,6 +168,22 @@ def w3_page(slug: str, title: str) -> bytes:
             f"</div></body></html>").encode()
 
 
+SVG = (b'<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100">'
+       b'<rect width="200" height="100" fill="#09c"/><circle cx="100" cy="50" r="30" fill="#fff"/>'
+       + b"<!-- " + b"x" * 800 + b" --></svg>")
+_B64 = __import__("base64").b64encode(_png()).decode()
+IMG_PAGE = ("<html><head><title>Images</title></head><body><article><h1>Images</h1>"
+            + "<p>" + "Some explanatory text about pictures. " * 30 + "</p>"
+            + '<img src="data:image/gif;base64,R0lGODlhAQABAAAAACH5BAEKAAEALAAAAAABAAEAAAICTAEAOw==" data-src="/img/a.png" alt="lazy">'
+            + '<img src="/img/hot.png" alt="hotlink protected">'
+            + '<img srcset="/img/deny-small.png 100w, /img/a.png 800w" alt="srcset">'
+            + '<picture><source srcset="/img/a.png 2x"><img alt="picture"></picture>'
+            + f'<img src="data:image/png;base64,{_B64}" alt="inline">'
+            + '<img src="/img/d.svg" alt="diagram">'
+            + "".join(f'<img src="/img/deny{i}.png" alt="refused {i}">' for i in range(8))
+            + "<p>" + "More text after the pictures, to be thorough. " * 30 + "</p></article></body></html>").encode()
+
+
 class Handler(BaseHTTPRequestHandler):
     hits: dict = {}
 
@@ -181,6 +197,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, b"User-agent: *\nDisallow: /private/\n", "text/plain")
         if path == "/img/a.png":
             return self._send(200, _png(), "image/png")
+        if path == "/img/hot.png":                                   # refuses hotlinking
+            if "127.0.0.1" not in (self.headers.get("Referer") or ""):
+                return self._send(403, b"no hotlinking")
+            return self._send(200, _png(), "image/png")
+        if path.startswith("/img/deny"):
+            return self._send(403, b"no")
+        if path == "/img/d.svg":
+            return self._send(200, SVG, "image/svg+xml")
+        if path == "/imgs/":
+            return self._send(200, IMG_PAGE)
         if path == "/sql/":
             return self._send(200, INDEX)
         if path == "/guide/":
@@ -577,3 +603,28 @@ def test_duplicates_are_reported_but_not_in_the_documents(tmp_path, site):
 def test_branding_and_user_agent():
     assert t.APP_NAME == "TutorialStudyForge" and t.APP_SHORT == "TSF" and "TutorialStudyForge-TSF" in t.USER_AGENT
     assert t.Settings().cache_dir.name == "tsf"
+
+
+def test_images_lazy_srcset_picture_inline_svg_and_referer(tmp_path, site):
+    out = tmp_path / "out"
+    base = ["--allow-private", "--delay", "0", "--cache-dir", str(tmp_path / "cache"), "--out-dir", str(out),
+            "--allow-partial", "--docx"]
+    assert t.main(["build", "--url", site + "/imgs/", "--yes"] + base) == 0
+    d = next(out.glob("*"))
+    art = json.loads((d / "chapters.json").read_text()) if (d / "chapters.json").exists() else None
+    assets = {p.suffix for p in (d / "assets").glob("*")}
+    assert ".png" in assets and ".svg" in assets                # lazy, hotlink (Referer), srcset, picture, inline, svg
+    assert len([p for p in (d / "assets").glob("*.png") if not p.name.endswith(".svg.png")]) == 1   # one picture, stored once
+    doc = _Doc(str(next(d.glob("*.docx"))))
+    n_shapes = len(doc.inline_shapes)
+    assert n_shapes >= 6 if t.svg_convertible() else n_shapes >= 5
+    text = "\n".join(p.text for p in doc.paragraphs)
+    assert text.count("Image not available") == 8 and "access_denied" in text
+    assert Handler.hits.get("/img/deny-small.png", 0) == 0       # srcset picked the widest candidate
+
+
+def test_refused_images_do_not_block_the_pages(tmp_path):
+    s = settings(tmp_path)
+    f = t.Fetcher(s)
+    f.denials["127.0.0.1#img"] = 99
+    assert f.denials.get("127.0.0.1", 0) == 0

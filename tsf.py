@@ -23,7 +23,9 @@ import json
 import logging
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import time
 import unicodedata
@@ -33,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 SCHEMA_VERSION = 1
 APP_NAME = "TutorialStudyForge"
 APP_SHORT = "TSF"
@@ -71,7 +73,8 @@ class Settings:
     timeout: float = 30.0
     max_page_bytes: int = 10 * 1024 * 1024
     max_image_bytes: int = 3 * 1024 * 1024
-    max_images_per_article: int = 40
+    max_images_per_article: int = 80
+    max_total_images: int = 3000
     max_pages: int = 200
     retries: int = 2
     cache_ttl_hours: float = 24 * 7
@@ -345,15 +348,16 @@ class Fetcher:
         return rp.can_fetch(USER_AGENT, url)
 
     # ---- main entry ----
-    def get(self, url: str, kind: str = "page") -> Fetched:
-        """Fetch a page or image with every protection applied. kind: 'page' | 'image'."""
+    def get(self, url: str, kind: str = "page", referer: str | None = None) -> Fetched:
+        """Fetch a page or image with every protection applied. kind: 'page' | 'image'.
+        Images are sent with the article as Referer, as a browser would (many image servers refuse hotlinking)."""
         try:
             validate_url_syntax(url, self.s.allow_private)
         except UrlError as e:
             raise FetchError("url", str(e)) from e
-        return self._get_chain(normalize_url(url), kind=kind)
+        return self._get_chain(normalize_url(url), kind=kind, referer=referer)
 
-    def _get_chain(self, url: str, kind: str) -> Fetched:
+    def _get_chain(self, url: str, kind: str, referer: str | None = None) -> Fetched:
         cached = self._cache_get(url)
         if cached:
             return cached
@@ -364,7 +368,8 @@ class Fetcher:
             p = validate_url_syntax(url, self.s.allow_private)
             host = p.hostname or ""
             port = p.port or (443 if p.scheme == "https" else 80)
-            if self.denials.get(host, 0) >= 3:
+            dkey = host + "#img" if kind == "image" else host     # a refused image must not block the pages
+            if self.denials.get(dkey, 0) >= (6 if kind == "image" else 3):
                 raise FetchError("host_blocked", f"Stopped requesting {host} after repeated 403/429 responses.")
             if not self.s.allow_private:
                 assert_public_host(host, port)
@@ -375,7 +380,7 @@ class Fetcher:
                 rp = self.robots.get(f"{p.scheme}://{p.netloc}")
                 if isinstance(rp, urllib.robotparser.RobotFileParser):
                     crawl_delay = float(rp.crawl_delay(USER_AGENT) or 0)
-            resp = self._request(url, host, kind, crawl_delay)
+            resp = self._request(url, host, kind, crawl_delay, referer)
             if resp.status_code in (301, 302, 303, 307, 308):
                 loc = resp.headers.get("Location")
                 resp.close()
@@ -393,12 +398,18 @@ class Fetcher:
             return f
         raise FetchError("http", "Too many redirects.")
 
-    def _request(self, url: str, host: str, kind: str, crawl_delay: float):
+    def _request(self, url: str, host: str, kind: str, crawl_delay: float, referer: str | None = None):
+        dkey = host + "#img" if kind == "image" else host
+        hdrs = {}
+        if kind == "image":
+            hdrs["Accept"] = "image/webp,image/png,image/jpeg,image/gif,image/svg+xml,image/*;q=0.8,*/*;q=0.5"
+            if referer:
+                hdrs["Referer"] = referer
         last_err: FetchError | None = None
         for attempt in range(self.s.retries + 1):
             self._wait(host, crawl_delay)
             try:
-                resp = self.sess.get(url, stream=True, allow_redirects=False,
+                resp = self.sess.get(url, stream=True, allow_redirects=False, headers=hdrs,
                                      timeout=(10, self.s.timeout))
             except requests.Timeout:
                 last_err = FetchError("timeout", f"Timed out fetching {url}")
@@ -413,10 +424,10 @@ class Fetcher:
                     raise FetchError("not_found", f"HTTP {sc} for {url}", sc)
                 if sc in (401, 403):
                     resp.close()
-                    self.denials[host] = self.denials.get(host, 0) + 1
+                    self.denials[dkey] = self.denials.get(dkey, 0) + 1
                     raise FetchError("access_denied", f"HTTP {sc} for {url}", sc)
                 if sc == 429:
-                    self.denials[host] = self.denials.get(host, 0) + 1
+                    self.denials[dkey] = self.denials.get(dkey, 0) + 1
                     wait = _retry_after(resp.headers.get("Retry-After"))
                     resp.close()
                     if attempt < self.s.retries and wait is not None and wait <= 60:
@@ -655,6 +666,49 @@ def abs_url(href: str | None, base: str | None) -> str | None:
     return u if u.lower().startswith(("http://", "https://")) else None
 
 
+LAZY_ATTRS = ("data-src", "data-lazy-src", "data-original", "data-lazy", "data-actualsrc", "data-orig-file")
+
+
+def best_from_srcset(v: str) -> str:
+    """The widest candidate of a srcset (or the first one when no widths are given)."""
+    best, best_w = "", -1.0
+    for part in (v or "").split(","):
+        bits = part.strip().split()
+        if not bits or bits[0].startswith("data:image/gif"):
+            continue
+        w = 0.0
+        if len(bits) > 1:
+            m = re.match(r"([\d.]+)[wx]$", bits[1])
+            w = float(m.group(1)) if m else 0.0
+        if w > best_w:
+            best, best_w = bits[0], w
+    return best
+
+
+def is_placeholder_src(src: str) -> bool:
+    return (not src) or bool(re.match(r"data:image/(gif|svg\+xml);base64,[A-Za-z0-9+/=]{0,200}$", src)) \
+        or bool(re.search(r"(placeholder|blank|spacer|loading|lazy)\.(gif|png|svg)", src, re.I))
+
+
+def pick_image_source(img: Tag) -> str:
+    """Real image address of an <img>: lazy-loading attributes and srcset win over a placeholder src."""
+    cands = [str(img.get(a) or "").strip() for a in LAZY_ATTRS]
+    cands.append(best_from_srcset(str(img.get("data-srcset") or "")))
+    cands.append(best_from_srcset(str(img.get("srcset") or "")))
+    par = img.parent
+    if par is not None and par.name == "source":          # lxml nests <img> inside the void <source>
+        cands.append(best_from_srcset(str(par.get("srcset") or par.get("data-srcset") or "")))
+        par = par.parent
+    if par is not None and par.name == "picture":
+        for so in par.find_all("source"):
+            cands.append(best_from_srcset(str(so.get("srcset") or so.get("data-srcset") or "")))
+    cands.append(str(img.get("src") or "").strip())
+    for c in cands:
+        if c and not is_placeholder_src(c):
+            return c
+    return ""
+
+
 class Extractor:
     """Turns a cleaned HTML container into typed blocks. Pure function of the HTML: no network."""
 
@@ -716,10 +770,8 @@ class Extractor:
 
     # ---- images ----
     def image_block(self, img: Tag, caption: str = "") -> dict | None:
-        src = img.get("data-src") or img.get("data-lazy-src") or img.get("data-original") or img.get("src") or ""
-        if not src and img.get("srcset"):
-            src = img["srcset"].split(",")[0].strip().split(" ")[0]
-        if not src or src.startswith("data:"):
+        src = pick_image_source(img)
+        if not src:
             return None
         if SKIP_IMG_TOKENS.search(" ".join(tokens(img)) + " " + src):
             return None
@@ -727,7 +779,8 @@ class Extractor:
             v = str(img.get(dim, "")).strip()
             if v.isdigit() and int(v) <= 24:
                 return None
-        return {"type": "image", "src": src, "url": abs_url(src, self.base) if self.base else None,
+        return {"type": "image", "src": src,
+                "url": None if src.startswith("data:") else (abs_url(src, self.base) if self.base else None),
                 "alt": collapse_ws(img.get("alt", "")), "caption": caption, "asset": None}
 
     # ---- block walk ----
@@ -785,6 +838,10 @@ class Extractor:
             b = self._table(el)
             if b:
                 out.append(b)
+            for im in el.find_all("img"):                    # pictures inside cells are shown after the table
+                ib = self.image_block(im)
+                if ib:
+                    out.append(ib)
         elif n == "blockquote":
             inner = self.walk(el)
             if inner:
@@ -980,6 +1037,12 @@ def clean_container(cont: Tag, profile: dict, s: Settings, warnings: list[str]) 
                 e.decompose()
         except Exception:
             pass
+    for so in cont.find_all("source"):                      # lxml nests the <img> of a <picture> inside <source>
+        im = so.find("img")
+        if im is not None:
+            if not im.get("srcset") and (so.get("srcset") or so.get("data-srcset")):
+                im["srcset"] = so.get("srcset") or so.get("data-srcset")
+            so.unwrap()
     for e in cont.find_all(DROP_TAGS - {"label", "map", "head", "title", "meta", "link"}):
         e.decompose()
     for e in cont.find_all(["nav", "header", "footer"]):
@@ -1544,11 +1607,25 @@ def sniff_image(data: bytes) -> str | None:
             return ext
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "webp"
+    head = data[:2048].lstrip(b"\xef\xbb\xbf \t\r\n")
+    if head[:5] == b"<?xml" or head[:4] == b"<svg":
+        if b"<svg" in data[:4096]:
+            return "svg"
     return None
 
 
+def decode_data_uri(src: str) -> bytes:
+    m = re.match(r"data:([\w/+.-]*)(;[^,]*)?,(.*)$", src, re.S)
+    if not m:
+        raise FetchError("url", "Unreadable inline image.")
+    if ";base64" in (m.group(2) or ""):
+        import base64
+        return base64.b64decode(m.group(3) + "=" * (-len(m.group(3)) % 4))
+    return urllib.parse.unquote_to_bytes(m.group(3))
+
+
 def attach_images(art: dict, fetcher: Fetcher | None, assets: Path, s: Settings, local_dir: Path | None,
-                  budget: dict) -> None:
+                  budget: dict, page_url: str | None = None) -> None:
     def rec(bs):
         for b in bs:
             if b["type"] == "image":
@@ -1566,12 +1643,19 @@ def attach_images(art: dict, fetcher: Fetcher | None, assets: Path, s: Settings,
         if not s.images:
             return
         if count >= s.max_images_per_article or budget["left"] <= 0:
-            art["warnings"].append("Image limit reached; some images were not downloaded.")
+            msg = "Image limit reached; some images were not downloaded (raise --max-images)."
+            if msg not in art["warnings"]:
+                art["warnings"].append(msg)
+            b["asset"], b["why"] = None, "image limit reached"
             return
         count += 1
         budget["left"] -= 1
         try:
-            if local_dir is not None and not re.match(r"^[a-z]+:", b["src"], re.I) and not b["src"].startswith("//"):
+            if b["src"].startswith("data:"):
+                data = decode_data_uri(b["src"])
+                if len(data) > s.max_image_bytes:
+                    raise FetchError("too_large", "Image too large.")
+            elif local_dir is not None and not re.match(r"^[a-z]+:", b["src"], re.I) and not b["src"].startswith("//"):
                 p = (local_dir / urllib.parse.unquote(b["src"].split("#")[0].split("?")[0])).resolve()
                 if local_dir.resolve() not in p.parents:
                     raise FetchError("ssrf", "Image path escapes the import folder.")
@@ -1579,13 +1663,13 @@ def attach_images(art: dict, fetcher: Fetcher | None, assets: Path, s: Settings,
                 if len(data) > s.max_image_bytes:
                     raise FetchError("too_large", "Image too large.")
             elif b.get("url") and fetcher is not None:
-                data = fetcher.get(b["url"], kind="image").body
+                data = fetcher.get(b["url"], kind="image", referer=page_url).body
             else:
                 raise FetchError("url", "No usable image URL.")
             ext = sniff_image(data)
             if not ext:
-                raise FetchError("bad_type", "Not a supported image type (png/jpg/gif/webp).")
-            if len(data) < 800:
+                raise FetchError("bad_type", "Not a supported image type (png/jpg/gif/webp/svg).")
+            if len(data) < 800 and ext != "svg":
                 b["asset"] = None
                 b["skipped"] = True
                 return
@@ -1596,7 +1680,7 @@ def attach_images(art: dict, fetcher: Fetcher | None, assets: Path, s: Settings,
         except (FetchError, OSError) as e:
             msg = e.message if isinstance(e, FetchError) else e.__class__.__name__
             art["warnings"].append(f"Image unavailable ({msg}): {b['src'][:80]}")
-            b["asset"] = None
+            b["asset"], b["why"] = None, (e.kind if isinstance(e, FetchError) else "io")
 
     rec(art["blocks"])
 
@@ -1676,8 +1760,9 @@ class HtmlRenderer:
                         f"{cap}</figure>\n")
             if b.get("skipped"):
                 return ""
-            label = b["caption"] or b["alt"] or "image"
-            return f'<p class="missing">[Image not available: {esc(label)}]</p>\n'
+            label = b["caption"] or b["alt"] or b.get("url") or "image"
+            why = f" - {b['why']}" if b.get("why") else ""
+            return f'<p class="missing">[Image not available{why}: {esc(label)}]</p>\n'
         if t == "quote":
             kind = f' class="callout callout-{esc(b["kind"])}"' if b["kind"] else ""
             label = f'<div class="callout-label">{esc(b["kind"].title())}</div>' if b["kind"] else ""
@@ -2069,7 +2154,7 @@ def process_chapters(chapters: list[Chapter], fetcher: Fetcher | None, s: Settin
     articles: list[dict] = []
     seen_hash: dict[str, int] = {}
     seen_url: dict[str, int] = {}
-    budget = {"left": 300}
+    budget = {"left": s.max_total_images}
     total = len(chapters)
     for ch in chapters:
         say(f"[{ch.index}/{total}] {ch.title or ch.url or ch.path}")
@@ -2112,7 +2197,7 @@ def process_chapters(chapters: list[Chapter], fetcher: Fetcher | None, s: Settin
                                "message": f"Content identical to chapter {other}.", "hint": ""})
                 else:
                     seen_hash[art["content_hash"]] = ch.index
-                    attach_images(art, fetcher, assets, s, local_dir, budget)
+                    attach_images(art, fetcher, assets, s, local_dir, budget, art.get("url") or ch.url)
                     art["counts"] = count_blocks(art["blocks"])
         except FetchError as e:
             art["status"] = "failed"
@@ -2229,6 +2314,18 @@ def build_pipeline(chapters: list[Chapter], s: Settings, fetcher: Fetcher | None
             f"{sum(not c['ok'] for c in checks)} verification check(s) failed.")
         for c in checks:
             say(f"  [{'pass' if c['ok'] else 'FAIL'}] {c['name']}" + (f" - {c['detail']}" if c["detail"] else ""))
+        n_img = sum(1 for a in doc_articles for b in _walk_blocks(a["blocks"]) if b["type"] == "image" and not b.get("skipped"))
+        miss = [b for a in doc_articles for b in _walk_blocks(a["blocks"])
+                if b["type"] == "image" and not b.get("asset") and not b.get("skipped")]
+        if n_img:
+            say(f"Images: {n_img - len(miss)} of {n_img} included.")
+        if miss:
+            from collections import Counter
+            why = ", ".join(f"{k} x{v}" for k, v in Counter(b.get("why", "unknown") for b in miss).items())
+            say(f"  {len(miss)} image(s) could not be downloaded ({why}). Details are in build.log; "
+                f"re-run with --refresh after fixing the cause, or see README > Troubleshooting.")
+            for b in miss[:5]:
+                log.warning("Missing image %s (%s)", b.get("url") or b["src"][:80], b.get("why"))
         say(f"Output: {out}")
         return 0
     finally:
@@ -2745,16 +2842,36 @@ class DocxBuilder:
             Image.open(path).convert("RGBA").save(out)
         return out
 
+    def _svg_to_png(self, path: Path) -> Path:
+        """Word cannot embed SVG reliably: rasterise it with cairosvg or rsvg-convert when one is installed."""
+        out = path.with_suffix(".svg.png")
+        if out.exists():
+            return out
+        try:
+            import cairosvg                                       # optional
+            cairosvg.svg2png(url=str(path), write_to=str(out), output_width=1200)
+            return out
+        except ImportError:
+            pass
+        exe = shutil.which("rsvg-convert")
+        if exe:
+            subprocess.run([exe, "-w", "1200", "-o", str(out), str(path)], check=True, timeout=60)
+            return out
+        raise RuntimeError("install cairosvg (pip install cairosvg) to embed SVG diagrams in Word")
+
     def _image(self, b: dict) -> None:
         if not b.get("asset"):
             if not b.get("skipped"):
                 p = self.par()
-                p.add_run(f"[Image not available: {xml_safe(b['caption'] or b['alt'] or 'image')}]").italic = True
+                why = f" - {b['why']}" if b.get("why") else ""
+                p.add_run(f"[Image not available{why}: {xml_safe(b['caption'] or b['alt'] or b.get('url') or 'image')}]").italic = True
             return
         path = self.assets / b["asset"]
         try:
             if path.suffix.lower() == ".webp":
                 path = self._webp_to_png(path)
+            elif path.suffix.lower() == ".svg":
+                path = self._svg_to_png(path)
             from docx.image.image import Image as DImage
             im = DImage.from_file(str(path))
             dpi = im.horz_dpi or 96
@@ -2925,6 +3042,14 @@ def build_docx(articles: list[dict], s: Settings, meta: dict, status: str, repor
     d.doc.save(str(out_path))
 
 
+def svg_convertible() -> bool:
+    try:
+        import cairosvg  # noqa: F401
+        return True
+    except ImportError:
+        return bool(shutil.which("rsvg-convert"))
+
+
 def _walk_blocks(bs: list[dict]):
     for b in bs:
         yield b
@@ -2965,7 +3090,7 @@ def verify_docx(path: Path, articles: list[dict], meta: dict, s: Settings) -> li
                 expected[xml_safe(b["text"])] += 1
             elif b["type"] == "equation":
                 expected[xml_safe(b["tex"])] += 1
-            elif b["type"] == "image" and b.get("asset"):
+            elif b["type"] == "image" and b.get("asset") and (not b["asset"].endswith(".svg") or svg_convertible()):
                 n_images += 1
     found = Counter(p.text for p in paras if p.style.name == "Code")
     lost = expected - found
@@ -3189,6 +3314,7 @@ def make_parser() -> argparse.ArgumentParser:
     d.add_argument("--section-selector", help="CSS selector for section headings, if sections are not detected")
     d.add_argument("--prefix", help="only keep links whose path starts with this, e.g. /linux-unix/")
     d.add_argument("--max-pages", type=int, default=200)
+    d.add_argument("--max-images", type=int, default=None, help="images to download in total (default 3000)")
 
     fmt = argparse.ArgumentParser(add_help=False)
     f = fmt.add_argument_group("what to include")
@@ -3258,6 +3384,8 @@ def settings_from(a: argparse.Namespace) -> Settings:
     s.section_selector = g("section_selector")
     s.min_words, s.verbose = g("min_words", 30), bool(g("verbose"))
     s.max_pages = g("max_pages", 200)
+    if g("max_images", None):
+        s.max_total_images = int(g("max_images"))
     s.out_dir = g("out_dir", Path("output")) or Path("output")
     s.title, s.subtitle, s.author = g("title") or "", g("subtitle") or "", g("author") or ""
     s.page_size, s.landscape = g("page_size", "A4"), bool(g("landscape"))

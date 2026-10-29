@@ -208,6 +208,8 @@ Pull requests with verified profiles are welcome.
 | Too few topics found | Try `--link-selector`, or paste a different start page of the tutorial. |
 | Wrong text included | Use `--selector` or `--drop-text REGEX`; check with `inspect`. |
 | Result named `-PARTIAL` | Some chapters failed; see `completeness.md`, then re-run (cache makes it quick). |
+| Images missing (`[Image not available - access_denied ...]`) | The run prints why. TSF sends the article as `Referer` (needed by many image servers), reads lazy-loaded, `srcset`, `<picture>`, inline and SVG images, and an image refusal never blocks the page host. If a site still refuses (403/robots), TSF respects it: use `--html` with pages saved from your browser (**Save as > Webpage, complete**). Raise the cap with `--max-images N` (default 3000). |
+| SVG diagrams missing in Word | SVG shows in the PDF. For Word run `pip install cairosvg` (or install `rsvg-convert`); without it Word shows a note. |
 | PDF fails on import of WeasyPrint | Install Pango (see [Install](#install)) or use `--docx --no-pdf`. |
 
 ## Responsible use
@@ -231,4 +233,6 @@ The whole tool is the single file `tsf.py`. The tests cover URL safety, extracti
 guided mode, PDF and Word output.
 
 ## License
-MIT License
+
+No license has been chosen yet. Add a `LICENSE` file (MIT is a common choice for tools like this) before
+publishing. Generated study guides remain subject to the licenses of their source sites.
