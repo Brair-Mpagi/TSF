@@ -1,0 +1,100 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# React build
+web/build/
+web/dist/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated PDFs and outputs
+output/
+*.pdf
+# Exception: Keep test fixtures
+!fixtures/**/*.pdf
+
+# Caches
+.cache/
+*.cache
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+code_quality.md
+gitworkflow.md
+Specification v2.md
+STATUS.md
+
+# Generated HTML from fetches (except approved fixtures)
+fetched_html/
+# Allow fixture HTML files
+!fixtures/**/*.html
+
+# Secrets
+secrets/
+*.key
+*.pem
+credentials.json
+
+# OS
+Thumbs.db
+.Spotlight-V100
+.Trashes

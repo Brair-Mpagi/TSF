@@ -1,0 +1,51 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+.python-version
+
+# --- Tests / tooling caches ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- TSF output and local data ---
+output/
+_out/
+_selftest_input/
+tsf-output/
+*.chapters.txt
+topics.txt
+chapters.json
+completeness.json
+completeness.md
+manifest.json
+build.log
+# Local site-rule overrides (keep a shareable copy as profiles.example.json)
+profiles.json
+.tsf/
+.cache/
+
+# --- Generated documents (never commit compiled third-party tutorials) ---
+*.pdf
+*.docx
+*.epub
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Word / LibreOffice temp files ---
+~$*
+.~lock.*#
+*.tmp
