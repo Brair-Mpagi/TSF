@@ -234,5 +234,4 @@ guided mode, PDF and Word output.
 
 ## License
 
-No license has been chosen yet. Add a `LICENSE` file (MIT is a common choice for tools like this) before
-publishing. Generated study guides remain subject to the licenses of their source sites.
+`MIT LICENSE`
